@@ -33,7 +33,7 @@ sizes:
 
 Choose another configured size with `/<base64-url>?size=900x1000`. Malformed or unconfigured sizes return 400. Each size must contain between 1 and 4,000,000 pixels.
 
-Domains include their subdomains, with a dot boundary. Approval is checked for the page, each redirect, and every image. DNS addresses are checked and pinned before connection; private and reserved networks are blocked. TLS certificates are verified. Environment proxies are ignored. Only successful 2xx upstream responses are rendered; upstream error responses and failed image downloads return an error without an image.
+Domains include their subdomains, with a dot boundary. Approval is checked for the page, each redirect, and every image. DNS addresses are checked and pinned before connection; private and reserved networks are blocked. Production requests use only ports 80 (HTTP) and 443 (HTTPS); the explicit local development mode permits other ports on approved loopback hosts. TLS certificates are verified. Environment proxies are ignored. Only successful 2xx upstream responses are rendered; upstream error responses and failed image downloads return an error without an image.
 
 ## Templates
 
@@ -41,7 +41,7 @@ The input page is hosted by your website; this service only fetches and renders 
 
 Takumi supports a subset of browser CSS. CSS inside `<style>` is used; linked stylesheets are ignored. Remote font loading, scripts and browser APIs are outside this MVP. Add fonts to the `fonts/` directory before starting the service: TTF, OTF, TTC, OTC, WOFF and WOFF2 files are discovered automatically in filename order. Other files, including font licenses, are ignored. Startup fails if no fonts are found or a font cannot be loaded. Takumi parses CSS; this service has no custom CSS parser.
 
-The service admits one request at a time, including fetching and rendering; concurrent requests receive 503. Pages are limited to 1 MiB and 64 nested elements. At most 16 unique images, 8 MiB per image, 24 MiB combined downloads and 16 million combined image pixels are allowed. The output is limited to 4 million pixels. Loading has a 20-second deadline. These limits bound normal MVP workloads; this is intended for templates you control.
+The service admits one request at a time, including fetching and rendering; concurrent requests receive 503. Pages are limited to 1 MiB, 4096 DOM nodes and 64 nested elements. At most 16 unique images, 8 MiB per image, 24 MiB combined downloads and 16 million combined image pixels are allowed. The output is limited to 4 million pixels. Loading has a 20-second deadline. HTML/CSS parsing and image rendering run on the blocking worker while holding the single render slot, including after a client disconnects. These limits bound normal MVP workloads; this is intended for templates you control.
 
 ## Production
 
@@ -81,6 +81,12 @@ for page in post/26085 question/10641 post/28086 question/25342; do
 done
 ```
 
-Environment variables: `SCR_CONFIG` selects the YAML file; `SCR_LISTEN` changes the bind address; `SCR_ALLOW_LOOPBACK=1` permits approved `localhost` or `127.0.0.1` sources for local development only.
+Each completed non-health request emits one JSON log line with `timestamp_ms` (UTC Unix milliseconds at request start), the full decoded `url`, resolved `size` (including the default), `ip`, `peer_ip`, `user_agent`, `method`, `status`, `bytes` and `duration_ms`. Invalid encoded URLs have `url: null`; malformed size queries have `size: null`. URL and user-agent control characters are JSON-escaped; user agents are limited to 1024 characters. Full source URLs, including query strings, are logged, so avoid putting secrets in preview URLs. CDN cache hits never reach the renderer and appear only in Cloudflare logs.
+
+Direct runs use the TCP peer IP and ignore forwarded headers. Compose enables `SCR_TRUST_PROXY=1` for the nginx deployment: only loopback/private IPv4 peers may supply `X-Real-IP`, and nginx overwrites that header. Keep the published port bound to loopback and the container network restricted to trusted services. Do not enable this option for a directly exposed server. Nginx trusts `CF-Connecting-IP` only from Cloudflare's published IP ranges, rate-limits clients to 5 requests/second with a burst of 10, and limits active requests to 32 globally. Keep its Cloudflare ranges current from [IPv4](https://www.cloudflare.com/ips-v4) and [IPv6](https://www.cloudflare.com/ips-v6). Headers from clients do not control upstream fetches, which never forward cookies or authorization.
+
+Rendering still handles untrusted CSS and image data in-process. The loading deadline cannot forcibly interrupt synchronous parsing or rendering; the container memory/PID limits and single render slot remain essential. The service is intended for preview templates on domains you control, not arbitrary public HTML.
+
+Environment variables: `SCR_TRUST_PROXY=1` accepts nginx's client-IP header in the isolated proxy deployment; `SCR_CONFIG` selects the YAML file; `SCR_LISTEN` changes the bind address; `SCR_ALLOW_LOOPBACK=1` permits approved `localhost` or `127.0.0.1` sources for local development only.
 
 The bundled Ubuntu font is distributed under the Ubuntu Font Licence; Noto Color Emoji is distributed under the SIL Open Font License. See `fonts/LICENSE`.

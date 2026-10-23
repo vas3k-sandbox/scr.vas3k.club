@@ -1,6 +1,8 @@
 services:
   scr:
     build: .
+    environment:
+      SCR_TRUST_PROXY: "1"
     ports:
       - "127.0.0.1:8202:8202"
     volumes:

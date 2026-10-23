@@ -18,6 +18,7 @@ static BLOCKED_NETWORKS: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
         "192.0.0.0/24",
         "192.0.2.0/24",
         "192.168.0.0/16",
+        "192.88.99.0/24",
         "198.18.0.0/15",
         "198.51.100.0/24",
         "203.0.113.0/24",
@@ -25,6 +26,7 @@ static BLOCKED_NETWORKS: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
         "2001::/23",
         "2001:db8::/32",
         "2002::/16",
+        "3ffe::/16",
         "3fff::/20",
     ]
     .into_iter()
@@ -56,6 +58,22 @@ pub fn validate(app: &App, url: &Url) -> Result<()> {
             "Only HTTP(S) URLs without credentials are supported".into(),
         ));
     }
+    let local = app.allow_loopback && matches!(host, "localhost" | "127.0.0.1");
+
+    if !local
+        && url.port_or_known_default()
+            != match url.scheme() {
+                "http" => Some(80),
+                "https" => Some(443),
+                _ => None,
+            }
+    {
+        return Err(Error(
+            StatusCode::FORBIDDEN,
+            "Only standard HTTP(S) ports are allowed".into(),
+        ));
+    }
+
     if !approved {
         return Err(Error(
             StatusCode::FORBIDDEN,

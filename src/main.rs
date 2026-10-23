@@ -4,14 +4,15 @@ mod render;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Router,
-    extract::{Path, Query, State},
+    body::HttpBody,
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{HeaderValue, StatusCode, header},
-    middleware,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -56,6 +57,7 @@ struct App {
     fonts: Fonts,
     slots: Arc<Semaphore>,
     allow_loopback: bool,
+    trust_proxy: bool,
 }
 
 #[derive(Deserialize)]
@@ -150,10 +152,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         fonts,
         slots: Arc::new(Semaphore::new(1)),
         allow_loopback: std::env::var("SCR_ALLOW_LOOPBACK").as_deref() == Ok("1"),
+        trust_proxy: std::env::var("SCR_TRUST_PROXY").as_deref() == Ok("1"),
     });
     let routes = Router::new()
         .route("/{encoded_url}", get(preview))
         .route("/healthz", get(|| async { "ok\n" }))
+        .layer(middleware::from_fn_with_state(app.clone(), log_request))
         .with_state(app)
         .layer(middleware::map_response(
             |mut response: Response| async move {
@@ -182,14 +186,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    axum::serve(listener, routes)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = terminate.recv() => {},
-            }
-        })
-        .await?;
+    axum::serve(
+        listener,
+        routes.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    })
+    .await?;
     Ok(())
 }
 
@@ -231,24 +238,90 @@ async fn preview(
             "Renderer is busy; retry shortly".into(),
         )
     })?;
-    let start = Instant::now();
-    let document = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        render::prepare(&app, url),
-    )
-    .await
-    .map_err(|_| Error(StatusCode::GATEWAY_TIMEOUT, "Page loading timed out".into()))??;
+    let runtime = tokio::runtime::Handle::current();
     let png = tokio::task::spawn_blocking(move || {
         let _slot = slot;
+        let document = runtime
+            .block_on(tokio::time::timeout(
+                Duration::from_secs(20),
+                render::prepare(&app, url),
+            ))
+            .map_err(|_| Error(StatusCode::GATEWAY_TIMEOUT, "Page loading timed out".into()))??;
         render::image(&app, document, size)
     })
     .await
     .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "Renderer failed".into()))??;
 
-    eprintln!(
-        "Rendered {} bytes in {:.1} ms",
-        png.len(),
-        start.elapsed().as_secs_f64() * 1000.0
-    );
     Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
+}
+
+async fn log_request(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path() == "/healthz" {
+        return next.run(request).await;
+    }
+
+    let start = Instant::now();
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let proxy_peer = peer.ip().is_loopback()
+        || matches!(peer.ip().to_canonical(), IpAddr::V4(ip) if ip.is_private());
+    let forwarded_ip = request
+        .headers()
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<IpAddr>().ok());
+    let ip = if app.trust_proxy && proxy_peer {
+        forwarded_ip.unwrap_or(peer.ip())
+    } else {
+        peer.ip()
+    };
+    let user_agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .chars()
+        .take(1024)
+        .collect::<String>();
+    let encoded = request.uri().path().trim_start_matches('/');
+    let url = (encoded.len() <= 8192)
+        .then(|| {
+            general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .or_else(|_| general_purpose::URL_SAFE.decode(encoded))
+                .ok()
+        })
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let size = Query::<PreviewOptions>::try_from_uri(request.uri())
+        .ok()
+        .map(|options| options.size.unwrap_or(app.config.sizes[0]))
+        .map(|size| format!("{}x{}", size.width, size.height));
+    let method = request.method().to_string();
+    let response = next.run(request).await;
+    let bytes = response.body().size_hint().exact().unwrap_or_default();
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "timestamp_ms": timestamp_ms,
+            "event": "request",
+            "method": method,
+            "url": url,
+            "size": size,
+            "ip": ip.to_string(),
+            "peer_ip": peer.ip().to_string(),
+            "user_agent": user_agent,
+            "status": response.status().as_u16(),
+            "bytes": bytes,
+            "duration_ms": (start.elapsed().as_secs_f64() * 10000.0).round() / 10.0,
+        })
+    );
+    response
 }

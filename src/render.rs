@@ -71,6 +71,13 @@ pub async fn prepare(app: &App, url: Url) -> Result<Document> {
 
 fn parse(html: &str) -> Result<(Node, StyleSheet, HashSet<String>)> {
     let document = Html::parse_document(html);
+    if document.tree.nodes().count() > 4096 {
+        return Err(Error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "HTML exceeds 4096 nodes".into(),
+        ));
+    }
+
     let style = Selector::parse("style").expect("valid style selector");
     let css: String = document
         .select(&style)
