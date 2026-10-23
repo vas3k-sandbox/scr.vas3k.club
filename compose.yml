@@ -1,0 +1,20 @@
+services:
+  scr:
+    build: .
+    ports:
+      - "127.0.0.1:8202:8202"
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - ./fonts:/app/fonts:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    pids_limit: 32
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
